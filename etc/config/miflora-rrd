@@ -1,0 +1,117 @@
+config miflora-rrd 'global'
+	option rrd_graph_path '/tmp/miflora-rrd/'
+    option rrd_db_path '/tmp/miflora-rrd/'
+	option rrd_step '3600' #historic values only available once per hour
+	option rrd_step_rows '672' #4weeks 4*7*24 (*step)
+	option rrd_cf_rows '28' #4weeks 4*7 (24*step)
+	option sleep_hours '24' #implies fetching 24 samples, sleeping 24 hours between fetches
+	option fetch_count '24' #fetching 24 samples, implies sleeping 24 hours between fetches	
+
+config sensor 'loreplant'
+	option enabled '1'
+	option MAC 'C4:7C:8D:62:B1:0D' 
+	option plant 'Chlorophytum'
+	option check_moisture '1'
+	option check_action '/bin/sendhousebotmsg "$__msg"'
+
+
+config sensor 'lemongrass'
+	option enabled '0'
+	option MAC 'C4:7C:8D:66:D7:C5' 
+	option plant 'cymbopogon_citratus'
+	option check_moisture '1'
+	option check_temperature '1'	
+	option check_action '/bin/sendhousebotmsg "$__msg"'
+
+config graph 'Temperature2d'
+	option enabled '1'
+	option filename 'Temperature2d.png'
+	list DEF 'T1=loreplant:temperature:AVERAGE'
+	list DEF 'L1=loreplant:light:AVERAGE'
+	list DEF 'Max1=loreplant:temperature:MAX'
+	list DEF 'Min1=loreplant:temperature:MIN'	
+	list DEF 'T2=lemongrass:temperature:AVERAGE'
+	list DEF 'L2=lemongrass:light:AVERAGE'
+	list DEF 'Min2=lemongrass:temperature:MIN'	
+	list DEF 'Max2=lemongrass:temperature:MAX'
+#	list LINE '-x HOUR:12:DAY:1:DAY:1:86400:%a%d'
+	list LINE '-y 1:5'
+	list LINE '--title Temperature'
+	list LINE '--start end-2d' 
+	list LINE '--width 800 --height 600'
+	list LINE '-c GRID#1C0C55 -c MGRID#1C0CAA'
+	list LINE 'CDEF:l1=L1,L2,+,400,/' #average and scale light down to fit on same graph
+	list LINE 'CDEF:min=Min1,Min2,MIN'  #MINNAN not available
+	list LINE 'CDEF:max=Max1,Max2,MAX'  #MAXNAN not available
+	list LINE 'AREA:max#FFF0F0' #lightred max temp
+	list LINE 'AREA:min#F0F0FF' #lightblue min temp
+	list LINE 'AREA:l1#1C0C55:Light'   #
+	list LINE 'LINE3:T1#990909:Loreplant'
+	list LINE 'LINE3:T2#FF0808:Lemongrass'
+	list LINE 'GPRINT:max:MAX:Maximum\:%2.lf'
+	list LINE 'GPRINT:min:MIN:Minimum\:%2.lf'
+
+
+config graph 'Temperature28d'
+	option enabled '1'
+	option filename 'Temperature28d.png' 
+	list DEF 'T1=loreplant:temperature:AVERAGE'
+	list DEF 'Max1=loreplant:temperature:MAX'
+	list DEF 'Min1=loreplant:temperature:MIN'	
+	list DEF 'T2=lemongrass:temperature:AVERAGE'
+	list DEF 'Min2=lemongrass:temperature:MIN'	
+	list DEF 'Max2=lemongrass:temperature:MAX'
+	list LINE '-c FONT#67a9cf -c CANVAS#ef8a62' #max temp background
+	list LINE '--start end-28d'
+	list LINE '--title Temperature'
+	list LINE '--width 1200 --height 300'
+	list LINE '-x HOUR:12:DAY:1:DAY:1:86400:%a%d'
+	list LINE 'CDEF:min=Min1,Min2,MIN'  #MINNAN not available
+	list LINE 'CDEF:max=Max1,Max2,MAX'  #MAXNAN not available
+	list LINE 'AREA:max#f7f7f7' # background for main graph
+	list LINE 'AREA:min#67a9cf' #lightblue min temp
+	list LINE 'LINE1:T1#990000:Loreplant'
+	list LINE 'LINE1:T2#FF0000:Lemongrass'
+
+config graph 'Moisture28d'
+	option enabled '1'
+	option filename 'Moisture28d.png' 
+	list DEF 'M1=loreplant:moisture:AVERAGE'
+	list DEF 'M2=lemongrass:moisture:AVERAGE'
+	list LINE '--start end-28d'
+	list LINE '--title Moisture'
+	list LINE '--width 1200 --height 300'
+	list LINE '-x HOUR:12:DAY:1:DAY:1:86400:%a%d'
+	list LINE 'LINE1:M1#990000:Loreplant'
+	list LINE 'LINE1:M2#FF0000:Lemongrass'
+
+
+config plant 'cymbopogon_citratus'
+#cymbopogon citratus,Cymbopogon citratus,cymbopogon citratus,http://pkb.resource.huahuacaocao.com/Y3ltYm9wb2dvbiBjaXRyYXR1cy5qcGc=?imageView2/1/w/%d/h/%d,,Tropical Asia,Southern #China,"Gramineae, Cymbopogon","Foliage plants, flowering and fruiting period during autumn and winter",Leaf color green,"Diameter â¥ 10 cm, height â¥ 15 cm",Peat or soil #with specific nutrients,"Like sunshine, grows in sunny places","Likes wet environments, water thoroughly when soil is dry, avoid saturated water","Dilute fertilizers following #instructions, apply 1-2 times monthly","Remove aged tissues, dead, rotten, diseased leaves timely",4500,2500,30000,4000,32,8,80,30,60,15,2000,350
+	option max_light_mmol	4500 
+	option min_light_mmol	2500 
+	option max_light_lux	30000 
+	option min_light_lux	4000 
+	option max_temp	32 
+	option min_temp	8 
+	option max_env_humid	80 
+	option min_env_humid	30 
+	option max_soil_moist	60 
+	option min_soil_moist	15 
+	option max_soil_ec	2000 
+	option min_soil_ec	350 
+
+config plant 'Chlorophytum'
+#hardcoded min/max for Chlorophytum - should get this from csv
+	option max_light_mmol	2700
+	option min_light_mmol	1600
+	option max_light_lux	30000
+	option min_light_lux	500
+	option max_temp			32
+	option min_temp			10
+	option max_env_humid	85
+	option min_env_humid	30
+	option max_soil_moist	60
+	option min_soil_moist	15
+	option max_soil_ec		1300
+	option min_soil_ec		200

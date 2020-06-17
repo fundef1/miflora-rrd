@@ -1,0 +1,605 @@
+#!/bin/sh
+. /lib/functions.sh
+
+#
+# openwrt/uci service
+# read and parse values from xiaomi miflora sensor and update an rrd
+# relies on gatttool as back-end do the actual comms with the BLE device
+#
+# gatttool/miflora times out regularly
+# script returns on failure but doesn't do retries.
+#
+# edited from https://www.fanjoe.be/?p=2741 
+# more info from https://wiki.hackerspace.pl/projects:xiaomi-flora 
+# and https://github.com/vrachieru/xiaomi-flower-care-api
+SCRIPT_NAME="$0"
+
+#defaults
+default_rrd_graph_path='/tmp/miflora-rrd/'
+default_rrd_db_path='/tmp/miflora-rrd/'
+default_rrd_step='3600' #every hour
+default_rrd_step_row='672' #4*7*24 4weeks
+default_rrd_cf_rows='28' #4*7 4 weeks
+default_fetch_count='24' #1 sample per hour so 1 day
+verbose=1
+
+
+#simple logging helper
+log () {
+	if [  ${verbose} -ge  ${1} ]; then
+		shift
+		echo "$*"
+	fi
+}
+
+# Print usage
+usage() {
+  echo -n "$SCRIPT_NAME [-param: value] -option ... 
+
+  gets and parses history from miflora sensors
+  updates rrds with hourly values, creates graphs
+  
+  depends on gatttool & rrdtool to do the work
+  sensor and graphs are defined via UCI
+
+ Parameters:
+  -C	    Create RRDs (if not already existing)
+ 
+  -G  		Create Graphs
+			
+  -U		Update RRDs
+  
+  -P        Check Plants 
+
+  -v        increase verbosity			
+  -h		Display this help and exit
+ 
+"
+}
+
+check_prereqs() {
+#TODO check for hci0 up else 
+#hciconfig hci0 up
+
+#TODO: shift through $@ instead of hardcoding
+	local __t=$(which $1)
+	if [ $? -ne 0 ]; then log 1 "EXITING: $1 not found"; exit 1; fi
+	eval $1=$__t
+	
+	__t=$(which $2)
+	which $2 > /dev/null
+	if [ $? -ne 0 ]; then log 1 "EXITING: $2 not found"; exit 1; fi
+	eval $2=$__t
+	
+}
+
+#parse_history #1:temperature $2:moisture $3:fertility $4:light $5:handle
+parse_history() {
+log 3 "parse_history: $5"
+log 4 "$*" 
+
+	local hnd3c="$5"
+	# format is differenty positioned from real-time data ;-/
+	# ab 5c 02 00 be 00 00 73 02 00 00 31 a0 02 00 00
+	# tt tt tt tt TT TT ?? LI LI LI ?? MO FE FE ?? ??
+	#								LI
+	# tt timestamp (seconds since device reboot)
+	# increments by 3600 , i.e. one measurement every hour
+	
+	#actual payload starts at pos 33
+	local ts=$(printf "%d" 0x${hnd3c:42:2}${hnd3c:39:2}${hnd3c:36:2}${hnd3c:33:2})
+	
+	log 4 "Timestamp: $ts"
+	
+	#grab next bytes and convert hex to dec 
+	local temp=$(printf "%d" 0x${hnd3c:48:2}${hnd3c:45:2})
+	
+	## assumes if temp is very large then it must be negative
+	if [ $temp -gt 32768 ]; then temp=$((-65536 + $temp)); fi
+
+	# # insert decimal dot: all but last char + . + 1 char from end 
+	temp=${temp:0: -1}.${temp: -1:1}
+	
+	log 4 "Temperature: $temp"
+	
+	# Light intensity in lux next 4 bytes
+	local lux=$(printf "%d" 0x${hnd3c:63:2}${hnd3c:60:2}${hnd3c:57:2}${hnd3c:54:2})
+	log 4 "Light: $lux"
+
+	# Moisture single byte in %?
+	local moist=$(printf "%d" 0x${hnd3c:66:2})
+	log 4 "Moisture: $moist"
+
+	# Fertility (some kind of conductivity measure?)
+	local fert=$(printf "%d" 0x${hnd3c:72:2}${hnd3c:69:2})
+	log 4 "Fertility: $fert"
+
+	#return values
+	eval $1=$temp
+	eval $2=$moist
+	eval $3=$fert
+	eval $4=$lux
+
+}
+
+
+
+#$1 sensor from uci 
+update_db() {
+log 3 "update_db: $1"
+log 4 "$*"
+
+	config_get enabled "$1" enabled
+	if [ $enabled = 1 ]; then
+
+		config_get fetch_count 'global' fetch_count; fetch_count=${fetch_count:=$default_fetch_count}
+		config_get MAC "$1" MAC; if [ -z $MAC ]; then log 2 "Skipping $1: MAC is empty"; return; fi
+
+		rrd_db="$1.rrd"
+		local __db=${rrd_db_path}${rrd_db}
+		
+		#TODO check if we cant't just use N-1d
+		local since_epoch=$(date +%s)
+		
+		if [ $fetch_count -gt 0 ]; then
+			# enable history read
+			# write 0xA00000  to 0x3e and 
+			# (immediately) read from 0x3c
+			# 
+			# gatttool --device=$MAC --char-write-req -a 0x3e -n A00000 &&
+			# gatttool --device=$MAC --char-read -a 0x3c
+			# 2a 00 bb 9f 76 14 08 00 a8 15 08 00 00 00 00 00
+			# cc cc ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ??
+		
+			ret=$(gatttool --device=$MAC --char-write-req -a 0x3e -n A00000 2>&1)
+			if [ $? -ne 0 ]; then log 1 "GATTTOOL $MAC failed: $ret"; return; fi
+			
+			hnd3c=$(gatttool --device=$MAC --char-read -a 0x3c)
+			if [ $? -ne 0 ]; then log 1 "GATTTOOL $MAC failed: $hnd3c"; return; fi
+			
+			#grab first two bytes and convert hex to dec 
+			hist_count=$(printf "%d" 0x${hnd3c:36:2}${hnd3c:33:2})
+			
+			# prevent reading bogus data
+			if [ $hist_count -lt $fetch_count ]; then fetch_count=$hist_count; fi
+			
+			# convenience for rrd: read oldest entry first
+			while [ $fetch_count -gt 0 ]	
+			do
+				# entries are 0 indexed
+				fetch_count=$(($fetch_count-1))
+		
+				#timestamps from flora are referenced to unknown reboot time
+				#assume sample is fetch_count hours before current time
+				local __ts=$(($since_epoch-$fetch_count*3600))
+				
+				log 4 "fetching sample from $__ts hours ago"
+				
+				# Next we need to read each historical entry individually.
+				# To do so we need to calculate it's address, write it to the history control handle (0x3e) 
+				# and then read the entry from the history data handle (0x3c).
+				
+				#the address for each individual entry is computed by adding two bytes representing the entry index to 0xa1.
+				#Entry 0's address will be 0xa10000, entry 1's address 0xa10100, entry 16's address 0xa11000
+						
+				ret=$(gatttool --device=$MAC --char-write-req -a 0x3e -n A1$(printf "%02X" $fetch_count)00 2>&1)
+				if [ $? -ne 0 ]; then log 1 "GATTTOOL $MAC failed: $ret"; return; fi
+				
+				hnd3c=$(gatttool --device=$MAC --char-read -a 0x3c)
+				if [ $? -ne 0 ]; then log 1 "GATTTOOL failed: $hnd3c"; return; fi
+		
+				parse_history temperature moisture fertility light "$hnd3c"
+				
+				log 2 "update $1 $__ts:$(date --date @$__ts):${temperature}:${moisture}:${fertility}:${light}"
+		
+				#TODO concat all updates into one big update command 
+				local __t=$($rrdtool update $__db $__ts:${temperature}:${moisture}:${fertility}:${light})
+				
+				if [ $? -ne 0 ]; then log 1 "ERROR: $__t"; fi
+				log 4 "$__t"
+		
+			done
+		fi
+	fi
+}
+
+update_graph(){
+	log 3 "update_graph: $1"
+	log 4 "$*"
+
+	config_get enabled "$1" enabled
+	if [ $enabled = 1 ]; then
+
+		#TODO:add some file/path checking
+		config_get rrd_graph_path 'global' rrd_graph_path; rrd_graph_path=${rrd_graph_path:=$default_rrd_graph_path}
+		mkdir -p $rrd_graph_path
+
+		config_get rrd_graph_path 'global' rrd_graph_path; rrd_graph_path=${rrd_graph_path:=$default_rrd_graph_path}
+		config_get filename "$1" filename; filename=${rrd_graph_path}${filename:=$1.png}
+		
+		local __DEFs=''
+		config_list_foreach "$1" DEF expand_DEF
+		config_list_foreach "$1" LINE append_LINE #hackily reusing __DEFs
+
+		create_graph $filename $__DEFs
+	fi
+}
+
+append_LINE(){
+	__DEFs="$__DEFs $1" 
+}
+
+#expand db_path in defs $1-list-string $2-var-to-return(DEFs) $3-append-to
+expand_DEF(){
+log 3 "expand_DEF"
+log 4 "$*"
+
+	#replace first occurence of = with =db_path
+	local __t="${1/=/=$rrd_db_path}"
+	#replace first occurence of : with .rrd:
+		 __t="${__t/:/.rrd:}"
+	#prepend DEF:
+		 __t="DEF:$__t"
+	#append new DEF to existing
+		 __DEFs="$__DEFs $__t" 
+}
+
+
+check_plant_values(){
+log 3 "check_plant_values"
+log 4 "$*"
+
+	config_get plant "$1" plant 
+	
+	config_get enabled "$1" enabled
+	config_get check_moisture "$1" check_moisture
+	config_get check_temperature "$1" check_temperature
+	
+	if [ $enabled = '1' ]; then
+	
+		rrd_db="$1.rrd"
+		local __db=${rrd_db_path}${rrd_db}
+		
+		if [ -f $__db ]; then
+#			config_get max_light_mmol "${plant}" max_light_mmol 
+#			config_get min_light_mmol "${plant}" min_light_mmol 
+			config_get max_light_lux  "${plant}" max_light_lux  
+			config_get min_light_lux  "${plant}" min_light_lux   
+			config_get max_temp  	  "${plant}" max_temp  	  
+			config_get min_temp		  "${plant}" min_temp		  
+#			config_get max_env_humid  "${plant}" max_env_humid   
+#			config_get min_env_humid  "${plant}" min_env_humid   
+			config_get max_soil_ec	  "${plant}" max_soil_ec	   
+			config_get min_soil_ec    "${plant}" min_soil_ec     
+					
+			local __l=$(rrdtool last "$__db")
+			local __l=$(($__l/3600*3600))
+			local __t=$(rrdtool fetch $__db -s $__l -e $__l AVERAGE | head -3 | tail -1 ) #ugly fetches last value
+			local __tmin=$(rrdtool fetch $__db -s $__l -e $__l MIN | head -3 | tail -1 ) #ugly 
+			local __tmax=$(rrdtool fetch $__db -s $__l -e $__l MAX | head -3 | tail -1 ) #ugly 
+
+			if [ X$check_moisture = X'1' ]; then 
+				check_moisture_fn "$1" "${plant}" "${__t}" "${__t}" 
+			fi #end moisture
+			if [ X$check_temperature = X'1' ]; then 
+				check_temperature_fn "$1" "${plant}" "${__tmin}" "${__tmax}" 
+			fi #end temperature
+
+		else
+			log 1 "rrd $__db for ${sensor} not found, skipping plant check"
+		fi
+	else
+		log 3 "sensor ${sensor} not enabled, skipping plant check"
+	fi
+}
+
+#$1:sensor $2plant $3:rrdmin $4:rrmad
+check_temperature_fn(){
+log 3 "check_temperature_fn"
+log 4 "$*"
+	#TODO check for NaN
+	parse_rrdfetch_temp temperature_min $3
+	parse_rrdfetch_temp temperature_max $4
+	config_get max_temp "${plant}" max_temp  
+	config_get min_temp "${plant}" min_temp 
+
+	config_get check_action "$1" check_action
+	check_action=${check_action:='log 1 $_msg'}
+
+	if [ $temperature_min -lt $min_temp ]; then 
+		local __msg="$1: Brrrrrrr too cold for a $2"
+		eval "$check_action"
+
+	fi
+	if [ $temperature_max -gt $max_temp ]; then
+		local __msg="$1: Phew a little too hot in here for a $2"
+		eval "$check_action"
+	fi
+	
+	
+}
+
+
+#$1:sensor $2plant $3:rrdmin $4:rrmad
+check_moisture_fn(){
+log 3 "check_moisture_fn"
+log 4 "$*"
+	#TODO check for NaN
+	parse_rrdfetch_moist moisture_min $3
+	parse_rrdfetch_moist moisture_max $4
+	config_get max_soil_moist "${plant}" max_soil_moist  
+	config_get min_soil_moist "${plant}" min_soil_moist 
+					
+	if [ $moisture_min -lt $min_soil_moist ]; then 
+		local __msg="$1: 77 bottles of beer on the wall but not one a for a ${2}?"
+	elif [ $moisture_max -gt $max_soil_moist ]; then
+		local __msg="$1: alright, I am soaked. Somebody, hang me out to dry please"
+	else			
+		log 2 "moisture ok for $1: $min_soil_moist < ${moisture_min}:${moisture_max} < $max_soil_moist for plant $2"	
+	fi
+	
+	if [ ! -z "$__msg" ]; then
+		log 1 "$__msg"
+		config_get check_action "$1" check_action
+		if [ ! -z "$check_action" ]; then
+			eval "$check_action"
+		fi
+	fi 
+}
+
+
+# rrdtool $1Mvar $2timestamp $3temp $4moist $5fert $6light
+parse_rrdfetch_moist(){
+log 3 "parse_rrdfetch_moist"
+log 4 "$*"
+
+	local __retvar=$1	
+	local __t=$(printf '%5.0f' $4)
+	
+	__t=$(echo $__t) #strip leading whitespace
+	
+	eval $__retvar=$__t
+}
+# rrdtool $1Tvar $2timestamp $3temp $4moist $5fert $6light
+parse_rrdfetch_temp(){
+log 3 "parse_rrdfetch_temp"
+log 4 "$*"
+
+	local __retvar=$1	
+	local __t=$(printf '%5.0f' $3) #cant -gt -lt compare close enough with integers 
+	
+	__t=$(echo $__t) #strip leading whitespace
+	
+	eval $__retvar=$__t
+}
+
+
+# $1Tvar $2Mvar $3Fvar $4Lvar (rrdtool $5timestamp $6temp $7moist $8fert $9light
+function parse_rrdtool_fetch1() {
+log 3 "parse_rrdtool_fetch1 $#"
+log 4 "$*"
+	echo "temp $6"
+	printf '%2.0f' $6
+	local __T = $(printf '%2.0f' $6 )
+#	local __M = $(printf '%2.0f' $8 )
+#	local __F = $(printf '%2.0f' $9 )
+#	local __L = $(printf '%2.0f' ${10} )
+
+#	eval $1 = $__T
+
+echo "T:$__T M:$__M F:$__F L:$__L"
+
+}
+
+#create_graph $1:filename $2:DEFs
+create_graph(){
+log 3 "create_graph"
+log 4 "$*"
+
+	local __t=$($rrdtool graph $*)
+	if [ $? -ne 0 ]; then log 1 "ERROR: $__t"; fi
+	log 4 "$__t"
+
+}
+
+
+check_create_db(){
+log 3 "check_create_db $1"
+log 4 "$@"
+
+	config_get enabled "$1" enabled
+	if [ $enabled = 1 ]; then
+
+		rrd_db="$1.rrd"
+		config_get rrd_step 'global' rrd_step; rrd_step=${rrd_step:=$default_rrd_step}
+		config_get rrd_step_rows 'global' rrd_step_rows; rrd_step_rows=${rrd_step_rows:=$default_rrd_step_rows}
+		config_get rrd_cf_rows 'global' rrd_cf_rows; rrd_cf_rows=${rrd_cf_rows:=$default_rrd_cf_rows}
+
+		local __db=${rrd_db_path}${rrd_db}
+		if [ -f $__db ]; then
+			log 4 "db $__db exists"
+		else
+			log 2 "creating new rrd $__db step:$rrd_step"
+			mkdir -p "$rrd_db_path"
+			$rrdtool create $__db --step $rrd_step --start 1585327759 \
+			DS:temperature:GAUGE:$(($rrd_step*2)):U:U \
+			DS:moisture:GAUGE:$(($rrd_step*2)):U:U \
+			DS:fertility:GAUGE:$(($rrd_step*2)):U:U \
+			DS:light:GAUGE:$(($rrd_step*2)):U:U \
+			RRA:AVERAGE:0.5:1:$rrd_step_rows \
+			RRA:MIN:0.5:24:$rrd_cf_rows \
+			RRA:MAX:0.5:24:$rrd_cf_rows \
+			RRA:AVERAGE:0.5:24:$rrd_cf_rows
+		fi
+	fi #enabled
+}
+
+
+
+
+############ parse args ########
+
+check_prereqs gatttool rrdtool
+
+config_load miflora-rrd
+#params from uci (if null replace with default_)
+config_get rrd_db_path global rrd_db_path; rrd_db_path=${rrd_db_path:=$default_rrd_db_path}
+
+#FIXME
+# lazy, will execute immediately -C
+# doesn't print anything when no options given
+while :; do
+    case $1 in
+        -h|-\?|--help) usage;exit 0;
+            ;;
+        -C) config_foreach check_create_db sensor
+            ;;
+        -U) config_foreach update_db sensor
+            ;;
+        -G) config_foreach update_graph graph
+            ;;
+        -P) config_foreach check_plant_values sensor
+            ;;
+        -v|--verbose)
+            verbose=$((verbose + 1)) # Each -v argument adds 1 to verbosity.
+			echo "verbose $verbose"
+            ;;
+        --)              # End of all options.
+            shift
+            break
+            ;;
+        -?*)
+            printf 'WARN: Unknown option (ignored): %s\n' "$1" >&2
+            ;;
+        *)               # Default case: If no more options then break out of the loop.
+            break
+    esac
+
+    shift
+done
+####################################
+
+
+exit 0
+
+
+################### old stuff to be sorted for real-time data ###################
+
+	
+	
+elif [ "$m" == "1" ];
+	then
+	# regular read of real-time data
+
+ 
+	# Le handle 0x0035 retourne : Temp (Int16) / Light (Int32) / Moisture (Int8) / Fertility (Int16)
+	# Characteristic value/descriptor: bb 00 00 36 01 00 00 10 51 00 02 3c 00 fb 34 9b 
+	# 								   TT TT ?? LI LI LI LI MO FE FE ?? ?? ?? ?? ?? ??
+	#gatttool --device=$MAC --char-read -a 0x35
+	#Characteristic value/descriptor: 8f 00 00 11 00 00 00 23 d9 01 02 3c 00 fb 34 9b 
+
+	# On écrit A01F dans le handle 0x0033 pour activer le live data dans le handle 0x0035
+	# enable live data reading
+	ret=$(gatttool --device=$MAC --char-write-req -a 0x33 -n A01F 2>&1)
+	if [ $? -ne 0 ]; then
+		echo "GATTTOOL failed: $ret"
+		exit 
+	fi
+
+	hnd35=$(gatttool --device=$MAC --char-read -a 0x35)
+	if [ $? -ne 0 ]; then
+		echo "GATTTOOL failed: $hnd35"
+		exit 
+	fi
+	
+	
+	################
+	#
+	# temperature is returned in hex as first two bytes 
+	# returned value is degrees Celsius*10 
+	# negative values are returned as FF -0.1 °C / F6 FF pour -1.0 °C / 9C FF pour -10.0 °C
+	# Real Température = -65536 + Température
+	# 
+	###########
+
+	#grab first two bytes and convert hex to dec 
+	temperature=$(printf "%d" 0x${hnd35:36:2}${hnd35:33:2})
+	 
+	# Lorsque la température est négative, les 2 premiers bytes affichent :
+	# FF FF pour -0.1 °C / F6 FF pour -1.0 °C / 9C FF pour -10.0 °C
+	# Soit la formule : Température = -65536 + Température
+	# J'ai arbitrairement fixé la température pivot à 32768 soit 3276.8 °C !!!
+	 
+	## assumes if temp is very large then it must be negative
+	if [ $temperature -gt 32768 ]; then
+		temperature=$((-65536 + $temperature))
+	fi
+
+	# # insert decimal dot: all but last char + . + 1 char from end 
+	temperature=${temperature:0: -1}.${temperature: -1:1}
+	
+	# Light intensity in lux next 4 bytes
+	light=$(printf "%d" 0x${hnd35:51:2}${hnd35:48:2}${hnd35:45:2}${hnd35:42:2})
+
+	# Moisture single byte in %?
+	moisture=$(printf "%d" 0x${hnd35:54:2})
+
+	# Fertility (some kind of conductivity measure?)
+	fertility=$(printf "%d" 0x${hnd35:60:2}${hnd35:57:2})
+	
+	if [ "$c" == "1" ] && [ "$n" == "0" ]; then
+		print_csv_header	 
+	fi
+	if [ "$c" == "1" ]; then
+		print_csv_line
+	fi
+	if [ "$c" == "0" ]; then
+		print_temperature
+		print_light
+		print_moisture
+		print_fertility
+	fi
+
+fi
+
+
+
+ 
+
+
+
+# Le handle 0x0003 retourne le nom du periphérique bluetooth en ASCII
+#gatttool --device=$MAC --char-read -a 0x03
+#Characteristic value/descriptor: 46 6c 6f 77 65 72 20 63 61 72 65
+#Flower care
+ 
+# #devname
+# echo "getting name"
+# hnd03=$(gatttool --device=$MAC --char-read -a 0x03)
+# # parse name from response
+# name=$(echo "$hnd03" |cut -c34-65 | xxd -r -p)
+# echo "Dev at " $MAC " : " $name
+
+
+# Le handle 0x0038 retourne : Battery (Int8) / Firmware version (5 bytes ASCII)
+#gatttool --device=$MAC --char-read -a 0x38
+#Characteristic value/descriptor: 63 27 33 2e 31 2e 38
+if [ $b == "1" ] || [ $v == "1" ]; then
+	hnd38=$(gatttool --device=$MAC --char-read -a 0x38 2>&1)
+	if [ $? -ne 0 ]; then
+		echo "GATTTOOL failed: $hnd38" >&2
+		exit 
+	fi
+fi
+
+#battery status (only changes once every 24h)
+if [ "$b" == "1" ]; then
+	printf "Battery: %d %%\n" 0x${hnd38:33:2}
+fi
+
+# Affichage de la version du firmware
+if [ "$v" == "1" ]; then
+   printf "Version: \x${hnd38: -15 : 2}\x${hnd38: -12 : 2}\x${hnd38: -9:2}\x${hnd38: -6:2}\x${hnd38: -3:2}\n"
+fi
+   
+ 

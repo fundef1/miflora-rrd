@@ -1,0 +1,6 @@
+#!/bin/sh
+#
+# should glob this
+# add check not to overwrite config
+cp -iu etc/config/miflora-rrd /etc/config/miflora-rrd
+cp -iu usr/bin/miflora-rrd /usr/bin/miflora-rrd
