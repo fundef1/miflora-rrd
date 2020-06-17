@@ -1,5 +1,7 @@
 #!/bin/sh
 #
+# should really check this in script, could be somewhere else depending on config
+mkdir -p /etc/miflora-rrd
 # should glob this
 # add check not to overwrite config
 cp -iu etc/config/miflora-rrd /etc/config/miflora-rrd
