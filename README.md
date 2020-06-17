@@ -1,5 +1,6 @@
 # miflora-rrd
-Openwrt oriented shell script for Xiami Miflora plant sensor
+Openwrt oriented shell script for Xiami Miflora plant sensor.\
+Pure shell script, no pythons required. 
 
 Meant to run as a daily cronjob,\
 fetches (historic) data from Xiaomi Miflora sensor.\
