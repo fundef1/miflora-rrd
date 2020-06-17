@@ -15,4 +15,6 @@ do ```/usr/bin/hciconfig hci0 up``` before calling ```miflora-rrd```
 
 (or just add that line to /etc/rc.local)
 
+You can get values for your plants heree: 
+https://raw.githubusercontent.com/khronimo/MiFloraDB/master/PlantDB_5335_U0.csv
 
