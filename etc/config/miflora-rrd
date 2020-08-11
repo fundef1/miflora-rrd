@@ -17,13 +17,13 @@ config sensor 'loreplant'
 config sensor 'indenhoek'
 	option enabled '1'
 	option MAC 'C4:7C:8D:66:D7:C5' 
-	option plant 'money_tree'
+	option plant 'Capsicum'
 	option check_moisture '1'
 	option check_temperature '1'	
 	option check_action '/bin/sendhousebotmsg "$__msg"'
 
 config graph 'Temperature2d'
-	option enabled '0'
+	option enabled '1'
 	option filename 'Temperature2d.png'
 	list DEF 'T1=loreplant:temperature:AVERAGE'
 	list DEF 'L1=loreplant:light:AVERAGE'
@@ -131,3 +131,20 @@ config plant 'Chlorophytum'
 	option min_soil_moist	15
 	option max_soil_ec		1300
 	option min_soil_ec		200
+
+config plant 'Capsicum'
+# paprika peperoni many versions same params
+#12000,4400,95000,3000,35,10,80,30,65,20,2000,150
+max_light_mmol,min_light_mmol,max_light_lux,min_light_lux,max_temp,min_temp,max_env_humid,min_env_humid,max_soil_moist,min_soil_moist,max_soil_ec,min_soil_ec
+	option max_light_mmol	12000
+	option min_light_mmol	4400
+	option max_light_lux	95000
+	option min_light_lux	3000
+	option max_temp			35
+	option min_temp			10
+	option max_env_humid	80
+	option min_env_humid	30
+	option max_soil_moist	65
+	option min_soil_moist	20
+	option max_soil_ec		2000
+	option min_soil_ec		150
